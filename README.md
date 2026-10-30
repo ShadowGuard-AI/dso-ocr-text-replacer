@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dso-ocr-text-replacer
 Replaces text recognized by OCR (Optical Character Recognition) in images or PDFs with placeholder text or other configurable values. - Focused on Tools for sanitizing and obfuscating sensitive data within text files and structured data formats
 
