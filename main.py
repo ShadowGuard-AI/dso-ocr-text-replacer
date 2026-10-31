@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional
 import io
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     print("Pillow is not installed. Please install it with: pip install Pillow")
     sys.exit(1)
@@ -43,7 +43,8 @@ def setup_argparse() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(description="Replaces text recognized by OCR in images or PDFs with placeholder text.")
     parser.add_argument("input_file", help="The input image or PDF file.")
-    parser.add_argument("-o", "--output_file", help="The output image or PDF file. If not specified, the input file will be overwritten.", required=False)
+    parser.add_argument("-o", "--output_file", help="The output image or PDF file. Required unless --in-place is given. An output path that resolves to the input file is refused.", required=False)
+    parser.add_argument("--in-place", action="store_true", help="Overwrite the input file in place. Only applies when -o is not given.", required=False)
     parser.add_argument("-r", "--replacement_text", default="REDACTED", help="The text to replace the OCR'd text with.  Defaults to 'REDACTED'.", required=False)
     parser.add_argument("-l", "--language", default="eng", help="The language to use for OCR. Defaults to 'eng' (English).", required=False)
     parser.add_argument("-d", "--dpi", type=int, default=200, help="The DPI to use when converting PDFs to images. Defaults to 200.", required=False)
@@ -107,21 +108,46 @@ def replace_text(text: str, replacement_text: str, pattern: Optional[str] = None
     return replaced_text
 
 
-def create_redacted_image(image: Image.Image, ocr_text: str, replaced_text: str) -> Image.Image:
-  """
-  Creates a redacted image by drawing black boxes over the detected text.
+def _word_boxes(image: Image.Image, language: str):
+    data = pytesseract.image_to_data(image, lang=language, output_type=pytesseract.Output.DICT)
+    boxes = []
+    texts = data.get("text", [])
+    for i, word in enumerate(texts):
+        if not word or not str(word).strip():
+            continue
+        try:
+            boxes.append((str(word), int(data["left"][i]), int(data["top"][i]), int(data["width"][i]), int(data["height"][i])))
+        except Exception:
+            continue
+    return boxes
 
-  Args:
-      image (Image.Image): The original image.
-      ocr_text (str): The original OCR'd text.
-      replaced_text (str): The text that replaced the original.  Not really used, but kept for potential extensions
 
-  Returns:
-      Image.Image: The redacted image.
-  """
-  # This simplified version creates a black image with the same dimensions.
-  # A more sophisticated version would identify the text location and redact only that part.
-  return Image.new("RGB", image.size, "black")
+def redact_image(image: Image.Image, replacement_text: str, pattern: Optional[str] = None, fake: bool = False, faker_locale: str = "en_US", language: str = "eng"):
+    result = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(result)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    fake_generator = Faker(faker_locale) if fake else None
+    count = 0
+    for word, x, y, w, h in _word_boxes(image, language):
+        if pattern and not re.search(pattern, word):
+            continue
+        replacement = fake_generator.name() if fake_generator is not None else replacement_text
+        draw.rectangle([x, y, x + w, y + h], fill="white")
+        if font is not None:
+            draw.text((x, y), replacement, fill="black", font=font)
+        else:
+            draw.text((x, y), replacement, fill="black")
+        count += 1
+    return result, count
+
+
+def create_redacted_image(image: Image.Image, ocr_text: str, replaced_text: str, pattern: Optional[str] = None, fake: bool = False, faker_locale: str = "en_US", replacement_text: Optional[str] = None, language: str = "eng") -> Image.Image:
+    repl = replacement_text if replacement_text is not None else replaced_text
+    result, _count = redact_image(image, repl, pattern=pattern, fake=fake, faker_locale=faker_locale, language=language)
+    return result
 
 
 
@@ -140,16 +166,22 @@ def process_image(image_path: str, output_path: str, replacement_text: str, lang
     """
     try:
         image = Image.open(image_path)
+        image.load()
         ocr_text = ocr_image(image, language)
-        replaced_text = replace_text(ocr_text, replacement_text, pattern, fake, faker_locale)
-        redacted_image = create_redacted_image(image, ocr_text, replaced_text)
+        redacted_image, count = redact_image(image, replacement_text, pattern=pattern, fake=fake, faker_locale=faker_locale, language=language)
+        if count == 0:
+            logging.error("No OCR text matched; nothing was replaced.")
+            sys.exit(1)
         redacted_image.save(output_path)
-        logging.info(f"Processed image: {image_path} -> {output_path}")
+        logging.info(f"Processed image: {image_path} -> {output_path} ({count} word(s) replaced)")
+    except SystemExit:
+        raise
     except FileNotFoundError:
         logging.error(f"Input file not found: {image_path}")
         sys.exit(1)
     except Exception as e:
         logging.error(f"Error processing image {image_path}: {e}")
+        sys.exit(1)
 
 
 def process_pdf(pdf_path: str, output_path: str, replacement_text: str, language: str, dpi: int, pattern: Optional[str], fake: bool, faker_locale: str) -> None:
@@ -168,20 +200,29 @@ def process_pdf(pdf_path: str, output_path: str, replacement_text: str, language
     """
     try:
         images = convert_from_path(pdf_path, dpi=dpi)
-        base_name = os.path.splitext(output_path)[0]  # Remove .pdf extension if it exists.
-
+        if not images:
+            logging.error("No pages were read from the PDF; nothing was replaced.")
+            sys.exit(1)
+        redacted_images = []
+        total = 0
         for i, image in enumerate(images):
-            image_output_path = f"{base_name}_page_{i+1}.png" # Save as PNG for simplicity
-            ocr_text = ocr_image(image, language)
-            replaced_text = replace_text(ocr_text, replacement_text, pattern, fake, faker_locale)
-            redacted_image = create_redacted_image(image, ocr_text, replaced_text)
-            redacted_image.save(image_output_path)
-            logging.info(f"Processed PDF page {i+1}: {pdf_path} -> {image_output_path}")
+            redacted_image, count = redact_image(image, replacement_text, pattern=pattern, fake=fake, faker_locale=faker_locale, language=language)
+            redacted_images.append(redacted_image)
+            total += count
+            logging.info(f"Processed PDF page {i+1}: {count} word(s) replaced")
+        if total == 0:
+            logging.error("No OCR text matched; nothing was replaced.")
+            sys.exit(1)
+        redacted_images[0].save(output_path, format="PDF", save_all=True, append_images=redacted_images[1:])
+        logging.info(f"Processed PDF: {pdf_path} -> {output_path} ({total} word(s) replaced)")
+    except SystemExit:
+        raise
     except FileNotFoundError:
         logging.error(f"Input file not found: {pdf_path}")
         sys.exit(1)
     except Exception as e:
         logging.error(f"Error processing PDF {pdf_path}: {e}")
+        sys.exit(1)
 
 
 def main() -> None:
@@ -192,7 +233,22 @@ def main() -> None:
     args = parser.parse_args()
 
     input_file = args.input_file
-    output_file = args.output_file if args.output_file else input_file  # Overwrite if not specified
+    if args.pattern:
+        try:
+            re.compile(args.pattern)
+        except re.error as e:
+            logging.error(f"Invalid pattern: {e}")
+            sys.exit(1)
+    if args.output_file:
+        if os.path.realpath(args.output_file) == os.path.realpath(input_file):
+            logging.error("Output file resolves to the input file; refusing to overwrite it. Use --in-place to overwrite intentionally.")
+            sys.exit(1)
+        output_file = args.output_file
+    elif getattr(args, "in_place", False):
+        output_file = input_file
+    else:
+        logging.error("No output file given. Pass -o for an output file or --in-place to overwrite the input file.")
+        sys.exit(1)
     replacement_text = args.replacement_text
     language = args.language
     dpi = args.dpi
