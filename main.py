@@ -7,6 +7,10 @@ from typing import List, Tuple, Optional
 import io
 
 try:
+    # I check each third-party import up front and stop with the install line.
+    # A missing library would otherwise surface as a traceback halfway through
+    # a run, after the user already pointed me at a real file. The cost is that
+    # even --help needs all four libraries present.
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     print("Pillow is not installed. Please install it with: pip install Pillow")
@@ -75,6 +79,8 @@ def ocr_image(image: Image.Image, language: str = "eng") -> str:
         raise
 
 
+# Text-level helper kept for callers that only have a string. The image and
+# PDF paths below do not use it; they work word by word in redact_image.
 def replace_text(text: str, replacement_text: str, pattern: Optional[str] = None, fake: bool = False, faker_locale: str = "en_US") -> str:
     """
     Replaces text based on a pattern (optional) or replaces the entire text.
@@ -108,14 +114,21 @@ def replace_text(text: str, replacement_text: str, pattern: Optional[str] = None
     return replaced_text
 
 
+# I redact from word boxes, not from the flat OCR string, because the
+# replacement has to land where the original word sat. The tesseract data
+# dict is parallel lists, so index i has to be the same word in every column.
 def _word_boxes(image: Image.Image, language: str):
     data = pytesseract.image_to_data(image, lang=language, output_type=pytesseract.Output.DICT)
     boxes = []
     texts = data.get("text", [])
     for i, word in enumerate(texts):
+        # Tesseract pads the dict with empty rows for layout blocks. Those rows
+        # carry no word to cover, and their coordinate fields are not reliable.
         if not word or not str(word).strip():
             continue
         try:
+            # A row with unparseable coordinates is skipped, not guessed at. Drawing a
+            # box at a made-up position would cover the wrong part of the page.
             boxes.append((str(word), int(data["left"][i]), int(data["top"][i]), int(data["width"][i]), int(data["height"][i])))
         except Exception:
             continue
@@ -123,6 +136,8 @@ def _word_boxes(image: Image.Image, language: str):
 
 
 def redact_image(image: Image.Image, replacement_text: str, pattern: Optional[str] = None, fake: bool = False, faker_locale: str = "en_US", language: str = "eng"):
+    # I draw on an RGB copy. Palette and alpha images take rectangle fills and
+    # saved output badly, and the caller's image stays untouched this way.
     result = image.convert("RGB").copy()
     draw = ImageDraw.Draw(result)
     try:
@@ -135,6 +150,9 @@ def redact_image(image: Image.Image, replacement_text: str, pattern: Optional[st
         if pattern and not re.search(pattern, word):
             continue
         replacement = fake_generator.name() if fake_generator is not None else replacement_text
+        # I blank the box first, then write over it. Drawing the replacement alone
+        # would leave the tails of a longer original word visible. The replacement
+        # is not shrunk to fit, so a long replacement can spill past the box.
         draw.rectangle([x, y, x + w, y + h], fill="white")
         if font is not None:
             draw.text((x, y), replacement, fill="black", font=font)
@@ -169,6 +187,8 @@ def process_image(image_path: str, output_path: str, replacement_text: str, lang
         image.load()
         ocr_text = ocr_image(image, language)
         redacted_image, count = redact_image(image, replacement_text, pattern=pattern, fake=fake, faker_locale=faker_locale, language=language)
+        # Zero replacements means the run did nothing the user asked for. I treat
+        # that as a failure, not a success with an unchanged copy as the output.
         if count == 0:
             logging.error("No OCR text matched; nothing was replaced.")
             sys.exit(1)
@@ -213,6 +233,8 @@ def process_pdf(pdf_path: str, output_path: str, replacement_text: str, language
         if total == 0:
             logging.error("No OCR text matched; nothing was replaced.")
             sys.exit(1)
+        # Pillow assembles a multi-page PDF from the first image plus append_images,
+        # so page one is passed as the save target instead of joining the list.
         redacted_images[0].save(output_path, format="PDF", save_all=True, append_images=redacted_images[1:])
         logging.info(f"Processed PDF: {pdf_path} -> {output_path} ({total} word(s) replaced)")
     except SystemExit:
@@ -235,11 +257,15 @@ def main() -> None:
     input_file = args.input_file
     if args.pattern:
         try:
+            # I compile the pattern before any file work. A bad regex should cost the
+            # user one second, not a full OCR pass that then throws away its result.
             re.compile(args.pattern)
         except re.error as e:
             logging.error(f"Invalid pattern: {e}")
             sys.exit(1)
     if args.output_file:
+        # realpath on both sides, so a symlink or a .. path to the same file is
+        # caught too. --in-place is the only sanctioned way to overwrite the input.
         if os.path.realpath(args.output_file) == os.path.realpath(input_file):
             logging.error("Output file resolves to the input file; refusing to overwrite it. Use --in-place to overwrite intentionally.")
             sys.exit(1)
@@ -257,6 +283,8 @@ def main() -> None:
     faker_locale = args.faker_locale
 
     # Input validation: check if the locale is valid
+    # This runs even when --fake was not passed, so an invalid locale stops a
+    # plain run too. I left that as is; the error names the locale either way.
     try:
         Faker(faker_locale)
     except AttributeError:
@@ -270,6 +298,8 @@ def main() -> None:
         sys.exit(1)
 
 
+    # Dispatch trusts the extension alone. A misnamed file reaches the wrong
+    # processor and fails there, and I would rather name that than sniff bytes.
     if input_file.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp')):
         process_image(input_file, output_file, replacement_text, language, pattern, fake, faker_locale)
     elif input_file.lower().endswith('.pdf'):
